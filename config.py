@@ -1,0 +1,28 @@
+# config.py
+N_AGENTS = 700
+INIT_BATTERY_J = 10_000.0
+
+# LEACH / cluster knobs
+P_BASE = 1.0 / N_AGENTS
+USE_LQ = False
+MAX_MEMBERS = N_AGENTS - 1
+E_FLOOR = 0.10 * INIT_BATTERY_J
+E_ABORT = 0.05 * INIT_BATTERY_J
+LEARNER_POLICY = "battery_lowest"   # battery_lowest | battery_highest | random | lq_best
+COLLECTOR_POLICY = "battery_lowest"
+K_LEARNERS_PER_ROUND = 16
+N_ROUNDS = 5
+
+# Example payload sizes (change to your real values)
+BITS_UPLINK_PER_LEARNER = 8_000_000   # 1 MB
+BITS_DOWNLINK_MODEL     = 8_000_000   # 1 MB
+
+# Example compute placeholders (replace with your numbers)
+LEARNER_COMPUTE_SEC = 0.02
+LEARNER_POWER_W     = 30.0
+CH_AGG_SEC          = 0.01
+CH_POWER_W          = 35.0
+
+# Radio energy model (example; replace with your calibrated figures)
+J_PER_BIT_TX = 2.5e-8   # 25 nJ / bit
+J_PER_BIT_RX = 1.0e-8   # 10 nJ / bit
