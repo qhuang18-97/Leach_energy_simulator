@@ -43,6 +43,85 @@ def mk_legacy_energy_and_link(
     link = LinkModel(p_tx_w=p_tx_w, p_rx_w=p_rx_w, r_up=r_up, r_dn=r_dn)
     return energy, link
 
+# def round_driver(
+#     ch_id: int,
+#     members: List[int],
+#     learners: List[int],
+#     collector: int,
+#     round_idx: int,
+#     *,
+#     energy: ParametricEnergy,
+#     link: LinkModel,
+#     # Use the exact payload sizes you used before. 4_440_128 was your previous default.
+#     weight_bits: int = 4_440_128,
+#     # If you also modeled batch exchanges and/or trajectory uploads, include their bits:
+#     batch_bits: Optional[int] = None,
+#     traj_bits: Optional[int] = None,
+#     broadcast_weights: bool = True,
+# ) -> List[Dict[str, Any]]:
+#     """
+#     Returns events with joules computed by your legacy ParametricEnergy:
+#       - Learner local compute
+#       - Learner -> CH weights upload
+#       - CH RX + aggregation compute
+#       - CH <-> Server (optional)
+#       - CH -> learners broadcast (optionally counted once, like before)
+#     """
+#     events: List[Dict[str, Any]] = []
+#     k = len(learners)
+#
+#     # 1) Learners local training compute
+#     for lid in learners:
+#         j = energy.compute_train()
+#         events.append({"round_idx": round_idx, "agent_id": lid, "role": "Learner", "kind": "compute", "joules": j})
+#
+#     # 2) (Optional) batch/trajectory traffic if you modeled it previously
+#     if traj_bits:
+#         for lid in learners:
+#             j_tx = energy.upload_data_member_tx(traj_bits, link)
+#             events.append({"round_idx": round_idx, "agent_id": lid, "role": "Learner", "kind": "comm", "joules": j_tx})
+#         j_rx = energy.upload_data_ch_rx(traj_bits * k, link)
+#         events.append({"round_idx": round_idx, "agent_id": ch_id, "role": "CH", "kind": "comm", "joules": j_rx})
+#
+#     if batch_bits:
+#         # learners receive batches; CH transmits
+#         j_ch_tx = energy.ch_batch_tx(batch_bits, link, k_members=k, broadcast=True)
+#         events.append({"round_idx": round_idx, "agent_id": ch_id, "role": "CH", "kind": "comm", "joules": j_ch_tx})
+#         for lid in learners:
+#             j_rx = energy.member_batch_rx(batch_bits, link)
+#             events.append({"round_idx": round_idx, "agent_id": lid, "role": "Learner", "kind": "comm", "joules": j_rx})
+#
+#     # 3) Learners -> CH weights upload
+#     for lid in learners:
+#         j_tx = energy.member_weights_tx(weight_bits, link)
+#         events.append({"round_idx": round_idx, "agent_id": lid, "role": "Learner", "kind": "comm", "joules": j_tx})
+#
+#     # 4) CH RX + aggregation compute (and optional server compute inside)
+#     j_ch_rx_agg = energy.ch_weights_rx(weight_bits, link, k_members=k)
+#     events.append({"round_idx": round_idx, "agent_id": ch_id, "role": "CH", "kind": "comm", "joules": j_ch_rx_agg})
+#
+#     # 5) CH <-> Server comm (if you modeled it)
+#     #    Pass bits=None if your previous model treated it as pure control/keepalive.
+#     j_up = energy.ch_to_server_tx(weight_bits, link)
+#     events.append({"round_idx": round_idx, "agent_id": ch_id, "role": "CH", "kind": "comm", "joules": j_up})
+#     j_dn = energy.server_to_ch_rx(weight_bits, link)
+#     events.append({"round_idx": round_idx, "agent_id": ch_id, "role": "CH", "kind": "comm", "joules": j_dn})
+#
+#     # 6) CH broadcast of new model to learners (if previously counted)
+#     if broadcast_weights:
+#         j_bcast = energy.ch_batch_tx(weight_bits, link, k_members=k, broadcast=True)
+#         events.append({"round_idx": round_idx, "agent_id": ch_id, "role": "CH", "kind": "comm", "joules": j_bcast})
+#         # If you also charged learners for RX, uncomment:
+#         # for lid in learners:
+#         #     j_rx = energy.member_batch_rx(weight_bits, link)
+#         #     events.append({"round_idx": round_idx, "agent_id": lid, "role": "Learner", "kind": "comm", "joules": j_rx})
+#
+#     return events
+# round_driver.py
+from typing import List, Dict, Any
+import config as C
+from energy_log_recorder import ParametricEnergy, LinkModel
+
 def round_driver(
     ch_id: int,
     members: List[int],
@@ -52,71 +131,81 @@ def round_driver(
     *,
     energy: ParametricEnergy,
     link: LinkModel,
-    # Use the exact payload sizes you used before. 4_440_128 was your previous default.
-    weight_bits: int = 4_440_128,
-    # If you also modeled batch exchanges and/or trajectory uploads, include their bits:
-    batch_bits: Optional[int] = None,
-    traj_bits: Optional[int] = None,
+    weight_bits: int,
+    batch_bits: int | None = None,
+    traj_bits: int | None = None,          # kept for backward compat; not used if EXP pipeline on
     broadcast_weights: bool = True,
 ) -> List[Dict[str, Any]]:
     """
-    Returns events with joules computed by your legacy ParametricEnergy:
-      - Learner local compute
-      - Learner -> CH weights upload
-      - CH RX + aggregation compute
-      - CH <-> Server (optional)
-      - CH -> learners broadcast (optionally counted once, like before)
+    Per-round comm/compute events with the added 'experience' pipeline:
+
+    Pipeline order:
+      0) (optional) Collector -> CH : upload NEW EXPERIENCE (EXP_BITS_PER_UPDATE)
+         CH -> Learners : broadcast NEW EXPERIENCE ; Learners RX new data
+      1) Learners compute locally
+      2) Learners -> CH : upload weights (member_weights_tx)
+         CH RX all weights (ch_weights_rx)
+      3) CH <-> Server : (optional) push/pull global model
+      4) CH -> Learners : broadcast UPDATED WEIGHTS ; Learners RX updated weights
     """
     events: List[Dict[str, Any]] = []
-    k = len(learners)
 
-    # 1) Learners local training compute
+    # ---------------- 0) Experience ingress & distribution ----------------
+    if C.ENABLE_EXPERIENCE_PIPELINE:
+        exp_bits = C.EXP_BITS_PER_UPDATE
+
+        # Collector uploads new experience to CH
+        # TX at collector
+        j_tx_col = energy.upload_data_member_tx(exp_bits, link)
+        events.append({"round_idx": round_idx, "agent_id": collector, "role": "Learner", "kind": "comm", "joules": j_tx_col})
+
+        # RX at CH
+        j_rx_ch = energy.upload_data_ch_rx(exp_bits, link)
+        events.append({"round_idx": round_idx, "agent_id": ch_id, "role": "CH", "kind": "comm", "joules": j_rx_ch})
+
+        # CH broadcasts the new experience to learners (one-to-many broadcast counted once at CH)
+        j_bcast_exp = energy.ch_batch_tx(exp_bits, link, k_members=len(learners), broadcast=True)
+        events.append({"round_idx": round_idx, "agent_id": ch_id, "role": "CH", "kind": "comm", "joules": j_bcast_exp})
+
+        # Each learner receives the new experience (count learner RX individually)
+        for lid in learners:
+            j_rx_l = energy.member_batch_rx(exp_bits, link)
+            events.append({"round_idx": round_idx, "agent_id": lid, "role": "Learner", "kind": "comm", "joules": j_rx_l})
+
+    # ---------------- 1) Learners local compute ----------------
     for lid in learners:
-        j = energy.compute_train()
-        events.append({"round_idx": round_idx, "agent_id": lid, "role": "Learner", "kind": "compute", "joules": j})
+        j_compute = energy.compute_train()
+        events.append({"round_idx": round_idx, "agent_id": lid, "role": "Learner", "kind": "compute", "joules": j_compute})
 
-    # 2) (Optional) batch/trajectory traffic if you modeled it previously
-    if traj_bits:
-        for lid in learners:
-            j_tx = energy.upload_data_member_tx(traj_bits, link)
-            events.append({"round_idx": round_idx, "agent_id": lid, "role": "Learner", "kind": "comm", "joules": j_tx})
-        j_rx = energy.upload_data_ch_rx(traj_bits * k, link)
-        events.append({"round_idx": round_idx, "agent_id": ch_id, "role": "CH", "kind": "comm", "joules": j_rx})
-
-    if batch_bits:
-        # learners receive batches; CH transmits
-        j_ch_tx = energy.ch_batch_tx(batch_bits, link, k_members=k, broadcast=True)
-        events.append({"round_idx": round_idx, "agent_id": ch_id, "role": "CH", "kind": "comm", "joules": j_ch_tx})
-        for lid in learners:
-            j_rx = energy.member_batch_rx(batch_bits, link)
-            events.append({"round_idx": round_idx, "agent_id": lid, "role": "Learner", "kind": "comm", "joules": j_rx})
-
-    # 3) Learners -> CH weights upload
+    # ---------------- 2) Learners upload weights ; CH RX+aggregate ----------------
     for lid in learners:
         j_tx = energy.member_weights_tx(weight_bits, link)
         events.append({"round_idx": round_idx, "agent_id": lid, "role": "Learner", "kind": "comm", "joules": j_tx})
 
-    # 4) CH RX + aggregation compute (and optional server compute inside)
-    j_ch_rx_agg = energy.ch_weights_rx(weight_bits, link, k_members=k)
+    # CH receives all learners' weights (RX + aggregation compute inside your energy class)
+    j_ch_rx_agg = energy.ch_weights_rx(weight_bits, link, k_members=len(learners))
     events.append({"round_idx": round_idx, "agent_id": ch_id, "role": "CH", "kind": "comm", "joules": j_ch_rx_agg})
 
-    # 5) CH <-> Server comm (if you modeled it)
-    #    Pass bits=None if your previous model treated it as pure control/keepalive.
+    # ---------------- 3) CH <-> Server exchange (if modeled) ----------------
     j_up = energy.ch_to_server_tx(weight_bits, link)
     events.append({"round_idx": round_idx, "agent_id": ch_id, "role": "CH", "kind": "comm", "joules": j_up})
     j_dn = energy.server_to_ch_rx(weight_bits, link)
     events.append({"round_idx": round_idx, "agent_id": ch_id, "role": "CH", "kind": "comm", "joules": j_dn})
 
-    # 6) CH broadcast of new model to learners (if previously counted)
+    # ---------------- 4) CH broadcasts UPDATED weights ; learners RX ----------------
     if broadcast_weights:
-        j_bcast = energy.ch_batch_tx(weight_bits, link, k_members=k, broadcast=True)
-        events.append({"round_idx": round_idx, "agent_id": ch_id, "role": "CH", "kind": "comm", "joules": j_bcast})
-        # If you also charged learners for RX, uncomment:
-        # for lid in learners:
-        #     j_rx = energy.member_batch_rx(weight_bits, link)
-        #     events.append({"round_idx": round_idx, "agent_id": lid, "role": "Learner", "kind": "comm", "joules": j_rx})
+        # CH one-shot broadcast of new global model
+        j_bcast_w = energy.ch_batch_tx(weight_bits, link, k_members=len(learners), broadcast=True)
+        events.append({"round_idx": round_idx, "agent_id": ch_id, "role": "CH", "kind": "comm", "joules": j_bcast_w})
+
+        if C.ENABLE_WEIGHT_BROADCAST_RX:
+            # Each learner receives the updated weights
+            for lid in learners:
+                j_rx = energy.member_batch_rx(weight_bits, link)
+                events.append({"round_idx": round_idx, "agent_id": lid, "role": "Learner", "kind": "comm", "joules": j_rx})
 
     return events
+
 
 def apply_energy_from_events(events: List[Dict[str, Any]]) -> Dict[int, float]:
     consumed = {}
